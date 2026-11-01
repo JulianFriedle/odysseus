@@ -337,19 +337,24 @@ _BROWSER_MCP_READ_TOOLS = frozenset(
 LOCAL_MCP_READ_TOOLS_ENV = "ODYSSEUS_LOCAL_MCP_READ_TOOLS"
 LOCAL_MCP_WRITE_TOOLS_ENV = "ODYSSEUS_LOCAL_MCP_WRITE_TOOLS"
 
-_LOCAL_MCP_READ_CAPABILITIES = _capabilities(ToolEffect.READ_PRIVATE)
-_LOCAL_MCP_WRITE_CAPABILITIES = _capabilities(ToolEffect.WRITE_PRIVATE)
+_LOCAL_MCP_READ_CAPABILITIES = _capabilities(
+    ToolEffect.READ_PRIVATE,
+    result_integrity=ResultIntegrity.EXTERNAL_UNTRUSTED,
+)
+_LOCAL_MCP_WRITE_CAPABILITIES = _capabilities(
+    ToolEffect.WRITE_PRIVATE,
+    result_integrity=ResultIntegrity.EXTERNAL_UNTRUSTED,
+)
 
 
 def _local_mcp_tools(variable: str) -> frozenset[str]:
     """Tool names a deployment declares as touching only the local store.
 
     Tools served by a user-configured MCP server are absent from the registry
-    above, so they are classified as unknown and fail high. That is the right
-    default for a server whose output may come from anywhere, but it makes a
-    server with both a read and a write tool unusable: the read result arms the
-    post-external gate, because unknown results are not SYSTEM integrity, and
-    the write that follows is then refused until separately authorized. Every
+    above, so they are classified as unknown and fail high. For a server with
+    both a read and a write tool that is unusable: the read result arms the
+    post-external gate, because an unknown result is not SYSTEM integrity, and
+    the write that follows is refused until separately authorized. Every
     second call needs an approval, for a server that never leaves the host.
 
     Declaring the tools resolves that without widening the gate:
@@ -357,17 +362,86 @@ def _local_mcp_tools(variable: str) -> frozenset[str]:
         ODYSSEUS_LOCAL_MCP_READ_TOOLS=mcp__<server>__search_notes,mcp__<server>__read_note
         ODYSSEUS_LOCAL_MCP_WRITE_TOOLS=mcp__<server>__create_note
 
-    Read tools become READ_PRIVATE with SYSTEM integrity, so their output no
-    longer arms the gate. Write tools become WRITE_PRIVATE, which remains in
-    POST_EXTERNAL_BLOCKED_EFFECTS: once genuinely external content has entered
-    the run, the approval is still required.
-
-    Only for servers whose results are the operator's own data and whose writes
-    stay local. A server that fetches from the network or sends anything
-    outwards must not be listed, or the gate stops protecting the run.
+    Read tools become READ_PRIVATE with EXTERNAL_UNTRUSTED integrity. Their
+    results remain untrusted and still arm the gate, preventing prompt
+    injections from reaching shell, network, or unrelated tools. However,
+    declared write tools on the exact same MCP server receive a narrowly
+    scoped continuation exception as long as no external or error taint has
+    entered the run. Once genuinely external content has entered the run,
+    approvals remain required.
     """
     raw = os.getenv(variable, "") or ""
     return frozenset(name.strip() for name in raw.split(",") if name.strip())
+
+
+def _is_declared_local_mcp_tool(
+    tool_name: Any, server_id: str | None = None
+) -> bool:
+    """Return whether tool_name is an exact, well-formed declared local MCP tool."""
+    if not isinstance(tool_name, str) or not tool_name:
+        return False
+    parts = tool_name.split("__", 2)
+    if not (
+        len(parts) == 3
+        and parts[0] == "mcp"
+        and bool(parts[1])
+        and bool(parts[2])
+        and not any(char.isspace() for part in parts[1:] for char in part)
+    ):
+        return False
+    if server_id is not None and parts[1] != server_id:
+        return False
+    declared_read = tool_name in _local_mcp_tools(LOCAL_MCP_READ_TOOLS_ENV)
+    declared_write = tool_name in _local_mcp_tools(LOCAL_MCP_WRITE_TOOLS_ENV)
+    return (declared_read or declared_write) and (declared_read != declared_write)
+
+
+def _is_declared_local_mcp_read_tool(
+    tool_name: Any, server_id: str | None = None
+) -> bool:
+    if not _is_declared_local_mcp_tool(tool_name, server_id):
+        return False
+    declared_read = tool_name in _local_mcp_tools(LOCAL_MCP_READ_TOOLS_ENV)
+    declared_write = tool_name in _local_mcp_tools(LOCAL_MCP_WRITE_TOOLS_ENV)
+    return declared_read and not declared_write
+
+
+def _is_declared_local_mcp_write_tool(
+    tool_name: Any, server_id: str | None = None
+) -> bool:
+    if not _is_declared_local_mcp_tool(tool_name, server_id):
+        return False
+    declared_read = tool_name in _local_mcp_tools(LOCAL_MCP_READ_TOOLS_ENV)
+    declared_write = tool_name in _local_mcp_tools(LOCAL_MCP_WRITE_TOOLS_ENV)
+    return declared_write and not declared_read
+
+
+def _is_authorized_local_mcp_continuation(
+    tool_name: Any,
+    external_sources: Iterable[str],
+) -> bool:
+    """Evaluate narrowly scoped continuation for declared local MCP tools.
+
+    Allows a declared local MCP read or write tool when the only untrusted
+    sources observed in the run are declared local MCP tools belonging to
+    the same MCP server (plus server-owned control plane metadata).
+    """
+    if not _is_declared_local_mcp_tool(tool_name):
+        return False
+    parts = tool_name.split("__", 2)
+    server_id = parts[1]
+    sources = list(external_sources or ())
+    if not sources:
+        return False
+    has_local_tool = False
+    for source in sources:
+        if source in _CONTROL_PLANE_CONTEXT_SOURCES:
+            continue
+        if _is_declared_local_mcp_tool(source, server_id=server_id):
+            has_local_tool = True
+            continue
+        return False
+    return has_local_tool
 
 
 def capabilities_for_tool(tool_name: Any) -> ToolCapabilities:
@@ -384,9 +458,9 @@ def capabilities_for_tool(tool_name: Any) -> ToolCapabilities:
             return capabilities
     if tool_name in _BROWSER_MCP_READ_TOOLS:
         return _BROWSER_MCP_READ_CAPABILITIES
-    if tool_name in _local_mcp_tools(LOCAL_MCP_READ_TOOLS_ENV):
+    if _is_declared_local_mcp_read_tool(tool_name):
         return _LOCAL_MCP_READ_CAPABILITIES
-    if tool_name in _local_mcp_tools(LOCAL_MCP_WRITE_TOOLS_ENV):
+    if _is_declared_local_mcp_write_tool(tool_name):
         return _LOCAL_MCP_WRITE_CAPABILITIES
     return _UNKNOWN_CAPABILITIES
 
@@ -844,6 +918,12 @@ class ToolRunSecurityContext:
     # Driven by a bearer API token, not a person at a browser. Privileged
     # tools are refused outright and no approval can lift that.
     delegated_credential: bool = False
+    explicit_untrusted_seen: bool = False
+    prompt_external_untrusted_seen: bool = False
+
+    def __post_init__(self) -> None:
+        if self.external_untrusted_context_seen and not self.external_sources:
+            self.prompt_external_untrusted_seen = True
 
     def observe_messages(self, messages: Iterable[dict]) -> None:
         """Apply server-owned chat scope and promote untrusted prompt context."""
@@ -874,8 +954,10 @@ class ToolRunSecurityContext:
             if source and source not in self.external_sources:
                 self.external_sources.append(source)
             self.external_untrusted_context_seen = True
+            self.prompt_external_untrusted_seen = True
         if messages_contain_external_untrusted_context(message_list):
             self.external_untrusted_context_seen = True
+            self.prompt_external_untrusted_seen = True
 
     def decision_for(self, tool_name: Any, content: Any = None) -> ToolGateDecision:
         # Checked before the bypasses below, because neither may lift it, and
@@ -896,6 +978,20 @@ class ToolRunSecurityContext:
         if isinstance(tool_name, str) and tool_name in self.unattended_tools:
             return ToolGateDecision(True)
         if not self.external_untrusted_context_seen:
+            return ToolGateDecision(True)
+
+        # Scoped continuation exception for explicitly declared local MCP tools:
+        # A declared write or read tool on the same MCP server is allowed if
+        # the run's only untrusted context was introduced by declared local
+        # tools on that server, without any explicit/error taint or external
+        # message context.
+        if (
+            not self.prompt_external_untrusted_seen
+            and not self.explicit_untrusted_seen
+            and _is_authorized_local_mcp_continuation(
+                tool_name, self.external_sources
+            )
+        ):
             return ToolGateDecision(True)
 
         # Skills and other server-owned descriptors are control-plane metadata
@@ -946,6 +1042,11 @@ class ToolRunSecurityContext:
         if not tool_result_should_arm_gate(tool_name, result, content):
             return
         self.external_untrusted_context_seen = True
+        if isinstance(result, dict) and (
+            result.get("untrusted_content") is True
+            or not tool_result_is_successful(result)
+        ):
+            self.explicit_untrusted_seen = True
         if isinstance(tool_name, str) and tool_name not in self.external_sources:
             self.external_sources.append(tool_name)
 

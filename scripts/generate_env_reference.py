@@ -492,6 +492,20 @@ VARIABLE_NOTES: dict[str, tuple[str, str, str]] = {
         "tools that execute code, mutate state or cause external side effects need "
         "a separate approval. Set to 0 to opt out.",
     ),
+    "ODYSSEUS_LOCAL_MCP_READ_TOOLS": (
+        "Agent loop and tool execution", USER,
+        "Security-relevant. Comma-separated exact MCP read-tool names "
+        "classified as private reads. Output remains untrusted to prevent "
+        "privilege escalation, but allows continuation to declared write "
+        "tools on the same server when no external taint is present.",
+    ),
+    "ODYSSEUS_LOCAL_MCP_WRITE_TOOLS": (
+        "Agent loop and tool execution", USER,
+        "Security-relevant. Comma-separated exact MCP write-tool names "
+        "classified as private writes. Allowed to execute after declared "
+        "local reads on the same server, but blocked once external "
+        "untrusted context enters the run.",
+    ),
     "ODYSSEUS_MCP_ALLOWED_COMMANDS": (
         "Agent loop and tool execution", USER,
         "Security-relevant. Comma-separated allowlist of MCP launcher basenames the "
