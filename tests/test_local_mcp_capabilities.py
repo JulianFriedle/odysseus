@@ -875,7 +875,23 @@ async def test_disposable_stdio_mcp_runtime_validation(monkeypatch):
     monkeypatch.setattr(execution, "_owner_is_admin", lambda owner: True)
 
     try:
-        auth = grant(read_name, write_name)
+        from src.agent_runtime.authority import (
+            create_request_authority,
+            ExactOperation,
+            bind_request_authority,
+        )
+
+        auth = create_request_authority(
+            "Read my local notes and create a new note summarizing them.",
+            owner="alice",
+            session_id="s",
+        )
+        assert auth.permits(
+            ExactOperation.normalize(read_name, '{"id":"first"}')
+        )
+        assert auth.permits(
+            ExactOperation.normalize(write_name, '{"text":"persisted"}')
+        )
         context = ToolRunSecurityContext()
 
         # Execute real read on stdio MCP subprocess
@@ -891,7 +907,8 @@ async def test_disposable_stdio_mcp_runtime_validation(monkeypatch):
         assert context.external_untrusted_context_seen is True
 
         # Continuation check on real stdio connection
-        assert _authorized_decision(context, write_name).allowed is True
+        with bind_request_authority(auth):
+            assert context.decision_for(write_name).allowed is True
 
         # Execute real write on stdio MCP subprocess
         _, write_res = await execution.execute_tool_block(
@@ -925,3 +942,61 @@ def test_local_continuation_requires_request_and_resource_authority(declared):
     authorized = grant(READ_TOOL, WRITE_TOOL)
     with bind_request_authority(authorized):
         assert context.decision_for(WRITE_TOOL).allowed is True
+
+
+
+def test_trusted_local_notes_request_admits_only_requested_operations(declared):
+    from src.agent_runtime.authority import create_request_authority, ExactOperation, bind_request_authority
+    from src.turn_contract import resolve_turn_contract
+    from src.tool_policy import ToolPolicy
+
+    authority = create_request_authority(
+        "Read my local notes and create a new note summarizing them.",
+        owner="alice", session_id="s",
+    )
+    for name in (READ_TOOL, WRITE_TOOL):
+        assert authority.permits(ExactOperation.normalize(name, "{}")) is True
+    assert authority.permits(ExactOperation.normalize(WRITE_TOOL_TWO, "{}")) is False
+    assert any(r.tool_id == READ_TOOL for r in authority.backend_resources if r.namespace == "mcp")
+
+    schema = lambda name: {"type": "function", "function": {"name": name,
+        "description": "Test MCP", "parameters": {"type": "object", "properties": {}}}}
+    with bind_request_authority(authority):
+        contract = resolve_turn_contract(
+            capabilities={"notes"},
+            schemas=[schema(name) for name in ("manage_notes", READ_TOOL, WRITE_TOOL, WRITE_TOOL_TWO)],
+            policy=ToolPolicy(),
+        )
+        assert READ_TOOL in contract.offered
+        assert WRITE_TOOL in contract.offered
+        assert WRITE_TOOL_TWO not in contract.offered
+        context = ToolRunSecurityContext()
+        context.observe_tool_result(READ_TOOL, RESULT)
+        assert context.decision_for(WRITE_TOOL).allowed is True
+
+
+def test_local_notes_read_only_request_does_not_grant_write(declared):
+    from src.agent_runtime.authority import create_request_authority, ExactOperation
+    authority = create_request_authority("Read my local notes.", owner="alice", session_id="s")
+    assert authority.permits(ExactOperation.normalize(READ_TOOL, "{}")) is True
+    assert authority.permits(ExactOperation.normalize(WRITE_TOOL, "{}")) is False
+
+
+def test_unrelated_request_cannot_mint_local_mcp_authority(declared):
+    from src.agent_runtime.authority import create_request_authority, ExactOperation
+    authority = create_request_authority("Search the public web for a restaurant.", owner="alice", session_id="s")
+    assert authority.permits(ExactOperation.normalize(READ_TOOL, "{}")) is False
+    assert authority.permits(ExactOperation.normalize(WRITE_TOOL, "{}")) is False
+
+
+def test_remote_mcp_cannot_mint_request_authority(declared):
+    from src.agent_runtime.authority import create_request_authority, ExactOperation
+    from src.tool_utils import set_mcp_manager
+    manager, _ = mock_mcp_manager(transport="http", url="https://remote.test/mcp")
+    set_mcp_manager(manager)
+    authority = create_request_authority(
+        "Read my local notes and create a new note summarizing them.",
+        owner="alice", session_id="s",
+    )
+    assert authority.permits(ExactOperation.normalize(READ_TOOL, "{}")) is False
+    assert authority.permits(ExactOperation.normalize(WRITE_TOOL, "{}")) is False
