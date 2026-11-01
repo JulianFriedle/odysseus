@@ -374,6 +374,23 @@ def _local_mcp_tools(variable: str) -> frozenset[str]:
     return frozenset(name.strip() for name in raw.split(",") if name.strip())
 
 
+def _current_mcp_manager():
+    """Retrieve the current McpManager instance safely without hard circular binds."""
+    try:
+        from src import tool_execution
+        if hasattr(tool_execution, "get_mcp_manager"):
+            mgr = tool_execution.get_mcp_manager()
+            if mgr is not None:
+                return mgr
+    except Exception:
+        pass
+    try:
+        from src.tool_utils import get_mcp_manager
+        return get_mcp_manager()
+    except Exception:
+        return None
+
+
 def _is_declared_local_mcp_tool(
     tool_name: Any, server_id: str | None = None
 ) -> bool:
@@ -389,7 +406,13 @@ def _is_declared_local_mcp_tool(
         and not any(char.isspace() for part in parts[1:] for char in part)
     ):
         return False
-    if server_id is not None and parts[1] != server_id:
+    sid = parts[1]
+    if server_id is not None and sid != server_id:
+        return False
+    from src.mcp_manager import McpManager
+    if McpManager.is_builtin(sid):
+        return False
+    if tool_name in TOOL_CAPABILITIES:
         return False
     declared_read = tool_name in _local_mcp_tools(LOCAL_MCP_READ_TOOLS_ENV)
     declared_write = tool_name in _local_mcp_tools(LOCAL_MCP_WRITE_TOOLS_ENV)
@@ -403,7 +426,22 @@ def _is_declared_local_mcp_read_tool(
         return False
     declared_read = tool_name in _local_mcp_tools(LOCAL_MCP_READ_TOOLS_ENV)
     declared_write = tool_name in _local_mcp_tools(LOCAL_MCP_WRITE_TOOLS_ENV)
-    return declared_read and not declared_write
+    if not (declared_read and not declared_write):
+        return False
+    parts = tool_name.split("__", 2)
+    mgr = _current_mcp_manager()
+    if mgr is not None:
+        tools = mgr._tools.get(parts[1], [])
+        tool_row = next((r for r in tools if r.get("name") == parts[2]), None)
+        if tool_row is not None:
+            from src.mcp_manager import mcp_tool_is_readonly
+            if not mcp_tool_is_readonly(tool_row):
+                return False
+    else:
+        from src.mcp_manager import _MCP_READONLY_VERBS
+        if not parts[2].lower().startswith(_MCP_READONLY_VERBS):
+            return False
+    return True
 
 
 def _is_declared_local_mcp_write_tool(
@@ -413,35 +451,23 @@ def _is_declared_local_mcp_write_tool(
         return False
     declared_read = tool_name in _local_mcp_tools(LOCAL_MCP_READ_TOOLS_ENV)
     declared_write = tool_name in _local_mcp_tools(LOCAL_MCP_WRITE_TOOLS_ENV)
-    return declared_write and not declared_read
-
-
-def _is_authorized_local_mcp_continuation(
-    tool_name: Any,
-    external_sources: Iterable[str],
-) -> bool:
-    """Evaluate narrowly scoped continuation for declared local MCP tools.
-
-    Allows a declared local MCP read or write tool when the only untrusted
-    sources observed in the run are declared local MCP tools belonging to
-    the same MCP server (plus server-owned control plane metadata).
-    """
-    if not _is_declared_local_mcp_tool(tool_name):
+    if not (declared_write and not declared_read):
         return False
     parts = tool_name.split("__", 2)
-    server_id = parts[1]
-    sources = list(external_sources or ())
-    if not sources:
-        return False
-    has_local_tool = False
-    for source in sources:
-        if source in _CONTROL_PLANE_CONTEXT_SOURCES:
-            continue
-        if _is_declared_local_mcp_tool(source, server_id=server_id):
-            has_local_tool = True
-            continue
-        return False
-    return has_local_tool
+    mgr = _current_mcp_manager()
+    if mgr is not None:
+        tools = mgr._tools.get(parts[1], [])
+        tool_row = next((r for r in tools if r.get("name") == parts[2]), None)
+        if tool_row is not None:
+            ann = tool_row.get("annotations") or {}
+            destructive = (
+                ann.get("destructiveHint")
+                if isinstance(ann, dict)
+                else getattr(ann, "destructiveHint", None)
+            )
+            if destructive is True:
+                return False
+    return True
 
 
 def capabilities_for_tool(tool_name: Any) -> ToolCapabilities:
@@ -899,6 +925,147 @@ def delegated_tool_is_blocked(tool_name: Any, content: Any = None) -> bool:
     )
 
 
+_SERVER_OWNED_CONTROL_PLANE_SOURCES = frozenset(
+    {
+        "skills",
+        "client runtime context",
+        "backend runtime context",
+        "integrations",
+        "mcp tools",
+        "agents.md",
+    }
+)
+
+_PROHIBITED_CONTINUATION_EFFECTS = frozenset(
+    {
+        ToolEffect.NETWORK_EGRESS,
+        ToolEffect.EXTERNAL_SIDE_EFFECT,
+        ToolEffect.EXECUTE_CODE,
+        ToolEffect.ADMIN_CHANGE,
+        ToolEffect.UI_SIDE_EFFECT,
+        ToolEffect.DESTRUCTIVE,
+        ToolEffect.READ_WORKSPACE,
+        ToolEffect.WRITE_WORKSPACE,
+        ToolEffect.BROKERED_NETWORK_READ,
+        ToolEffect.READ_PUBLIC,
+    }
+)
+
+
+def _is_authorized_local_mcp_continuation(
+    tool_name: Any,
+    external_sources: Iterable[str],
+    content: Any = None,
+) -> bool:
+    """Evaluate narrowly scoped continuation for declared local MCP tools.
+
+    Allows a declared local MCP write or read tool when the tool is verified
+    against an explicitly configured and connected stdio MCP server, and the
+    only untrusted sources observed in the run are declared local MCP tools
+    belonging to the exact same MCP server (plus server-owned control plane
+    metadata).
+    """
+    if not isinstance(tool_name, str) or not tool_name:
+        return False
+    parts = tool_name.split("__", 2)
+    if len(parts) != 3 or parts[0] != "mcp" or not parts[1] or not parts[2]:
+        return False
+    server_id = parts[1]
+
+    from src.mcp_manager import McpManager
+    if McpManager.is_builtin(server_id):
+        return False
+
+    if not _is_declared_local_mcp_tool(tool_name, server_id=server_id):
+        return False
+
+    capabilities = capabilities_for_action(tool_name, content)
+    if not capabilities.known:
+        return False
+    if capabilities.effects & _PROHIBITED_CONTINUATION_EFFECTS:
+        return False
+    if capabilities.effects - {ToolEffect.WRITE_PRIVATE, ToolEffect.READ_PRIVATE}:
+        return False
+
+    manager = _current_mcp_manager()
+    if manager is None:
+        return False
+    if manager.is_builtin(server_id):
+        return False
+
+    conn = manager.get_server_status(server_id)
+    if conn.get("status") != "connected":
+        return False
+    if conn.get("transport") != "stdio":
+        return False
+
+    resource_id = manager.resource_identity(tool_name)
+    if resource_id is None or resource_id.namespace != "mcp":
+        return False
+    if not str(resource_id.endpoint_id).startswith("stdio:"):
+        return False
+
+    tools_list = manager._tools.get(server_id, [])
+    tool_row = next((r for r in tools_list if r.get("name") == parts[2]), None)
+    if not tool_row:
+        return False
+    ann = tool_row.get("annotations") or {}
+    destructive = (
+        ann.get("destructiveHint")
+        if isinstance(ann, dict)
+        else getattr(ann, "destructiveHint", None)
+    )
+    if destructive is True:
+        return False
+
+    from src.agent_runtime.authority import active_request_authority, ExactOperation
+    authority = active_request_authority()
+    if authority is not None:
+        try:
+            operation_input = content if isinstance(content, str) else "{}"
+            operation = ExactOperation.normalize(tool_name, operation_input)
+            if not authority.permits(operation):
+                return False
+        except (ValueError, TypeError):
+            return False
+        if authority.backend_resources is not None and resource_id not in authority.backend_resources:
+            return False
+
+    sources = list(external_sources or ())
+    if not sources:
+        return False
+
+    from src.mcp_manager import mcp_tool_is_readonly
+    has_local_tool = False
+    for source in sources:
+        if source in _SERVER_OWNED_CONTROL_PLANE_SOURCES:
+            continue
+        if not _is_declared_local_mcp_tool(source, server_id=server_id):
+            return False
+        source_caps = capabilities_for_tool(source)
+        if not source_caps.known or (source_caps.effects & _PROHIBITED_CONTINUATION_EFFECTS):
+            return False
+        if source_caps.effects - {ToolEffect.READ_PRIVATE, ToolEffect.WRITE_PRIVATE}:
+            return False
+
+        source_resource = manager.resource_identity(source)
+        if source_resource is None or source_resource.endpoint_id != resource_id.endpoint_id:
+            return False
+        if not str(source_resource.endpoint_id).startswith("stdio:"):
+            return False
+
+        source_parts = source.split("__", 2)
+        source_row = next((r for r in tools_list if r.get("name") == source_parts[2]), None)
+        if not source_row:
+            return False
+        if _is_declared_local_mcp_read_tool(source, server_id=server_id) and not mcp_tool_is_readonly(source_row):
+            return False
+
+        has_local_tool = True
+
+    return has_local_tool
+
+
 @dataclass
 class ToolRunSecurityContext:
     """Server-owned integrity state for one agent run."""
@@ -922,7 +1089,14 @@ class ToolRunSecurityContext:
     prompt_external_untrusted_seen: bool = False
 
     def __post_init__(self) -> None:
-        if self.external_untrusted_context_seen and not self.external_sources:
+        if self.external_untrusted_context_seen and (
+            not self.external_sources
+            or any(
+                not _is_declared_local_mcp_tool(s)
+                and s not in _SERVER_OWNED_CONTROL_PLANE_SOURCES
+                for s in self.external_sources
+            )
+        ):
             self.prompt_external_untrusted_seen = True
 
     def observe_messages(self, messages: Iterable[dict]) -> None:
@@ -989,7 +1163,7 @@ class ToolRunSecurityContext:
             not self.prompt_external_untrusted_seen
             and not self.explicit_untrusted_seen
             and _is_authorized_local_mcp_continuation(
-                tool_name, self.external_sources
+                tool_name, self.external_sources, content=content
             )
         ):
             return ToolGateDecision(True)

