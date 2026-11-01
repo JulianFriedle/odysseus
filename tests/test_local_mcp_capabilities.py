@@ -87,6 +87,22 @@ def grant(*tools, resources=None, owner="alice", session_id="s"):
     )
 
 
+
+def _authorized_decision(context, tool_name):
+    """Evaluate a tool decision under a valid sealed test authority."""
+    from src.agent_runtime.authority import bind_request_authority
+
+    observed = [
+        source
+        for source in context.external_sources
+        if isinstance(source, str) and source.startswith("mcp__")
+    ]
+    tools = tuple(dict.fromkeys([*observed, tool_name]))
+
+    with bind_request_authority(grant(*tools)):
+        return context.decision_for(tool_name)
+
+
 def mock_mcp_manager(
     server="a1b2c3d4",
     tools=("search_notes", "read_note", "create_note", "update_note"),
@@ -207,7 +223,7 @@ async def test_ordinary_local_read_followed_by_authorized_local_write(
     context = ToolRunSecurityContext()
     context.observe_tool_result(READ_TOOL, RESULT)
     assert context.external_untrusted_context_seen is True
-    assert context.decision_for(WRITE_TOOL).allowed is True
+    assert _authorized_decision(context, WRITE_TOOL).allowed is True
 
     manager = execution.get_mcp_manager()
     session = manager._sessions["a1b2c3d4"]
@@ -283,7 +299,7 @@ def test_local_read_followed_by_different_mcp_server_write(
     assert context.external_untrusted_context_seen is True
 
     # Same server write is allowed
-    assert context.decision_for(WRITE_TOOL).allowed is True
+    assert _authorized_decision(context, WRITE_TOOL).allowed is True
 
     # Foreign server write is blocked
     decision = context.decision_for(FOREIGN_WRITE)
@@ -473,7 +489,7 @@ def test_concurrent_requests_do_not_leak_continuation_authority(declared):
 
     # Turn A performs local read
     context_a.observe_tool_result(READ_TOOL, RESULT)
-    assert context_a.decision_for(WRITE_TOOL).allowed is True
+    assert _authorized_decision(context_a, WRITE_TOOL).allowed is True
 
     # Turn B is independent and has not observed anything
     assert context_b.external_untrusted_context_seen is False
@@ -485,7 +501,7 @@ def test_concurrent_requests_do_not_leak_continuation_authority(declared):
     assert context_b.decision_for(WRITE_TOOL).allowed is False
 
     # Turn A remains uncorrupted by turn B's external taint
-    assert context_a.decision_for(WRITE_TOOL).allowed is True
+    assert _authorized_decision(context_a, WRITE_TOOL).allowed is True
 
 
 # 18. Approval denial does not dispatch the tool.
@@ -734,7 +750,7 @@ async def test_tool_discovery_removal_fails_closed(declared, monkeypatch):
 
     context = ToolRunSecurityContext()
     context.observe_tool_result(READ_TOOL, RESULT)
-    assert context.decision_for(WRITE_TOOL).allowed is True
+    assert _authorized_decision(context, WRITE_TOOL).allowed is True
 
     # Drop WRITE_TOOL from discovered tools
     manager._tools["a1b2c3d4"] = [{"name": "search_notes"}, {"name": "read_note"}]
@@ -803,7 +819,7 @@ def test_server_owned_control_plane_sources_allow_continuation(declared, server_
         external_untrusted_context_seen=True,
         external_sources=[server_owned_source, READ_TOOL],
     )
-    assert context.decision_for(WRITE_TOOL).allowed is True
+    assert _authorized_decision(context, WRITE_TOOL).allowed is True
 
 
 # 30. Deterministic runtime validation against a disposable stdio MCP server subprocess.
@@ -875,7 +891,7 @@ async def test_disposable_stdio_mcp_runtime_validation(monkeypatch):
         assert context.external_untrusted_context_seen is True
 
         # Continuation check on real stdio connection
-        assert context.decision_for(write_name).allowed is True
+        assert _authorized_decision(context, write_name).allowed is True
 
         # Execute real write on stdio MCP subprocess
         _, write_res = await execution.execute_tool_block(
@@ -890,3 +906,22 @@ async def test_disposable_stdio_mcp_runtime_validation(monkeypatch):
     finally:
         await manager.disconnect_server(server_id)
         set_mcp_manager(None)
+
+
+def test_local_continuation_requires_request_and_resource_authority(declared):
+    from src.agent_runtime.authority import bind_request_authority
+
+    context = ToolRunSecurityContext()
+    context.observe_tool_result(READ_TOOL, RESULT)
+
+    assert context.decision_for(WRITE_TOOL).allowed is False
+
+    without_resource = grant(
+        READ_TOOL, WRITE_TOOL, resources=()
+    )
+    with bind_request_authority(without_resource):
+        assert context.decision_for(WRITE_TOOL).allowed is False
+
+    authorized = grant(READ_TOOL, WRITE_TOOL)
+    with bind_request_authority(authorized):
+        assert context.decision_for(WRITE_TOOL).allowed is True

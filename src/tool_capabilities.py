@@ -1002,7 +1002,7 @@ def _is_authorized_local_mcp_continuation(
     resource_id = manager.resource_identity(tool_name)
     if resource_id is None or resource_id.namespace != "mcp":
         return False
-    if not str(resource_id.endpoint_id).startswith("stdio:"):
+    if resource_id.endpoint_id != f"stdio:{server_id}":
         return False
 
     tools_list = manager._tools.get(server_id, [])
@@ -1018,8 +1018,10 @@ def _is_authorized_local_mcp_continuation(
     if destructive is True:
         return False
 
-    from src.agent_runtime.authority import active_request_authority, ExactOperation
+    from src.agent_runtime.authority import active_request_authority, ExactOperation, RequestAuthority
     authority = active_request_authority()
+    if not isinstance(authority, RequestAuthority):
+        return False
     if authority is not None:
         try:
             operation_input = content if isinstance(content, str) else "{}"
@@ -1028,7 +1030,7 @@ def _is_authorized_local_mcp_continuation(
                 return False
         except (ValueError, TypeError):
             return False
-        if authority.backend_resources is not None and resource_id not in authority.backend_resources:
+        if resource_id not in authority.backend_resources:
             return False
 
     sources = list(external_sources or ())
